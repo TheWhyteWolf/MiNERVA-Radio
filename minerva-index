@@ -1,0 +1,418 @@
+#!/bin/bash
+
+# =============================================================================
+# Universal Music Catalogue Indexer
+# Indexes VGM (.vgm/.vgz) AND Audio (.mp3/.wav/.flac) files into a dual-sheet
+# Excel workbook (vgm_catalogue.xlsx).
+#
+# Sheet 1 — VGM Catalogue  : mirrors original Indexer logic
+# Sheet 2 — Audio Catalogue: includes embedded metadata (Artist/Album/Title etc.)
+#
+# Requirements:
+#   - python3 + openpyxl   (pip install openpyxl)
+#   - ffprobe              (part of ffmpeg — used for audio metadata extraction)
+#
+# Usage:
+#   ./Indexer_Universal.sh [WORK_DIR]
+#   WORK_DIR defaults to the current directory if omitted.
+# =============================================================================
+
+WORK_DIR="${1:-.}"
+OUTPUT_XLSX="$WORK_DIR/vgm_catalogue.xlsx"
+TEMP_VGM="$WORK_DIR/_tmp_vgm.csv"
+TEMP_AUDIO="$WORK_DIR/_tmp_audio.csv"
+
+echo "Indexing : $WORK_DIR"
+echo "Output   : $OUTPUT_XLSX"
+echo "------------------------------------------"
+
+# --- Dependency checks -------------------------------------------------------
+if ! command -v python3 &>/dev/null; then
+    echo "ERROR: python3 is required but not found." >&2; exit 1
+fi
+if ! python3 -c "import openpyxl" &>/dev/null; then
+    echo "ERROR: openpyxl not found. Run: pip install openpyxl" >&2; exit 1
+fi
+HAS_FFPROBE=true
+if ! command -v ffprobe &>/dev/null; then
+    echo "NOTE: ffprobe not found — all metadata will be derived from directory/filename structure."
+    echo "      Install ffmpeg to enable embedded tag extraction (used as primary source)."
+    HAS_FFPROBE=false
+else
+    echo "NOTE: ffprobe found — embedded tags used where present; directory structure fills any gaps."
+fi
+
+# --- Shared config -----------------------------------------------------------
+excluded="cli-visualizer|clivisualizer|libvgm|build|__MACOSX|Xtract|DeAccent|indexer|Loose"
+
+# Returns 0 (true) if a folder contains subdirs but no direct vgz/vgm files
+is_platform_folder() {
+    local dir="$1"
+    local has_files has_dirs
+    has_files=$(find "$dir" -maxdepth 1 -type f \( -name "*.vgz" -o -name "*.vgm" \) | head -1)
+    has_dirs=$(find  "$dir" -maxdepth 1 -mindepth 1 -type d | head -1)
+    [[ -z "$has_files" && -n "$has_dirs" ]]
+}
+
+# Same check but for audio files
+is_platform_folder_audio() {
+    local dir="$1"
+    local has_files has_dirs
+    has_files=$(find "$dir" -maxdepth 1 -type f \( -name "*.mp3" -o -name "*.wav" -o -name "*.flac" \) | head -1)
+    has_dirs=$(find  "$dir" -maxdepth 1 -mindepth 1 -type d | head -1)
+    [[ -z "$has_files" && -n "$has_dirs" ]]
+}
+
+# Extracts a single ffprobe tag; returns empty string if unavailable or ffprobe absent
+get_tag() {
+    local file="$1" tag="$2"
+    if $HAS_FFPROBE; then
+        ffprobe -v quiet -show_entries "format_tags=$tag" \
+                -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -1
+    fi
+}
+
+# Strips extension from a filename:  "03 - Cool Song.mp3" -> "03 - Cool Song"
+strip_ext() { echo "${1%.*}"; }
+
+# Extracts a leading track number from a filename if present:
+#   "03 - Cool Song.mp3" -> "3"
+#   "Track03_Song.mp3"   -> "3"
+#   "Cool Song.mp3"      -> ""
+extract_track_num() {
+    local base
+    base=$(strip_ext "$1")
+    # Match one or two leading digits optionally followed by space/dash/dot/underscore
+    if [[ "$base" =~ ^0*([0-9]{1,3})[[:space:]_.\-] ]]; then
+        echo "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Resolve metadata for one audio file, with directory-structure fallback.
+# Arguments: file  tld_name  platform_name  folder_name  file_id
+# Sets globals: r_artist  r_album  r_title  r_track  r_year  r_genre  r_source
+resolve_meta() {
+    local file="$1" tld_n="$2" platform_n="$3" folder_n="$4" fid="$5"
+    local file_name
+    file_name=$(basename "$file")
+
+    # Reset globals
+    r_artist=""; r_album=""; r_title=""; r_track=""; r_year=""; r_genre=""; r_source=""
+
+    # --- Step 1: attempt to read embedded tags via ffprobe ---
+    if $HAS_FFPROBE; then
+        r_artist=$(get_tag "$file" "artist")
+        r_album=$(get_tag  "$file" "album")
+        r_title=$(get_tag  "$file" "title")
+        r_track=$(get_tag  "$file" "track")
+        r_year=$(get_tag   "$file" "date")
+        r_genre=$(get_tag  "$file" "genre")
+    fi
+
+    # Record whether embedded tags supplied the three core display fields
+    local tagged_artist=false tagged_album=false tagged_title=false
+    [[ -n "$r_artist" ]] && tagged_artist=true
+    [[ -n "$r_album"  ]] && tagged_album=true
+    [[ -n "$r_title"  ]] && tagged_title=true
+
+    # --- Step 2: fill any missing core fields from directory structure ---
+
+    # Artist → TLD folder name (top-level collection / composer / label)
+    if [[ -z "$r_artist" ]]; then
+        r_artist="$tld_n"
+    fi
+
+    # Album  → platform/artist subfolder when present, otherwise the immediate parent folder
+    if [[ -z "$r_album" ]]; then
+        if [[ -n "$platform_n" ]]; then
+            r_album="$platform_n"
+        else
+            r_album="$folder_n"
+        fi
+    fi
+
+    # Track Title → filename minus extension, also strip common "NN - " / "NN. " prefixes
+    if [[ -z "$r_title" ]]; then
+        local stripped
+        stripped=$(strip_ext "$file_name")
+        if [[ "$stripped" =~ ^0*[0-9]{1,3}[[:space:]_.)-]+(.+)$ ]]; then
+            r_title="${BASH_REMATCH[1]}"
+        else
+            r_title="$stripped"
+        fi
+    fi
+
+    # Track Number → try to parse from filename first; fall back to FILE_ID position
+    if [[ -z "$r_track" ]]; then
+        r_track=$(extract_track_num "$file_name")
+        [[ -z "$r_track" ]] && r_track="$fid"
+    fi
+
+    # Year / Genre → no reliable directory equivalent; remain blank if untagged
+    : "${r_year:=}" "${r_genre:=}"
+
+    # --- Step 3: set source indicator ---
+    if $tagged_artist && $tagged_album && $tagged_title; then
+        r_source="tagged"           # all three core fields came from embedded tags
+    elif $tagged_artist || $tagged_album || $tagged_title; then
+        r_source="partial"          # mix of tags and derived values
+    else
+        r_source="derived"          # no usable embedded tags; everything from structure
+    fi
+}
+
+# CSV-safe: escape double quotes by doubling them
+csv_escape() { echo "${1//\"/\"\"}"; }
+
+# =============================================================================
+# PASS 1 — VGM Catalogue
+# =============================================================================
+echo "TLD_ID,SUB_ID,PLATFORM_ID,FILE_ID,Catalogue_ID,TLD_Name,Platform_Name,Game_Name,File_Name" > "$TEMP_VGM"
+
+tld_id=100; sub_id=1000
+total_vgm_tracks=0; total_vgm_subdirs=0; total_vgm_tlds=0
+
+mapfile -t tlds < <(find "$WORK_DIR" -maxdepth 1 -mindepth 1 -type d | grep -vE "$excluded" | sort)
+
+for tld in "${tlds[@]}"; do
+    tld_name=$(basename "$tld")
+
+    # Skip if no vgm/vgz files anywhere beneath this TLD
+    if ! find "$tld" -type f \( -name "*.vgz" -o -name "*.vgm" \) | grep -q .; then
+        continue
+    fi
+
+    echo "VGM TLD: $tld_name ($tld_id)"
+    ((total_vgm_tlds++))
+    platform_id=1
+
+    mapfile -t subdirs < <(find "$tld" -maxdepth 1 -mindepth 1 -type d | sort)
+
+    for subdir in "${subdirs[@]}"; do
+        subdir_name=$(basename "$subdir")
+
+        if is_platform_folder "$subdir"; then
+            echo "  Platform: $subdir_name"
+            mapfile -t games < <(find "$subdir" -maxdepth 1 -mindepth 1 -type d | sort)
+
+            for game in "${games[@]}"; do
+                game_name=$(basename "$game")
+                file_id=1
+                mapfile -t files < <(find "$game" -type f \( -name "*.vgz" -o -name "*.vgm" \) | sort)
+                [[ ${#files[@]} -eq 0 ]] && continue
+                ((total_vgm_subdirs++))
+
+                for file in "${files[@]}"; do
+                    file_name=$(basename "$file")
+                    cat_id="${tld_id}-${sub_id}-${file_id}"
+                    echo "${tld_id},${sub_id},${platform_id},${file_id},\"$(csv_escape "$cat_id")\",\"$(csv_escape "$tld_name")\",\"$(csv_escape "$subdir_name")\",\"$(csv_escape "$game_name")\",\"$(csv_escape "$file_name")\"" >> "$TEMP_VGM"
+                    ((file_id++)); ((total_vgm_tracks++))
+                done
+                ((sub_id++))
+            done
+            ((platform_id++))
+        else
+            file_id=1
+            mapfile -t files < <(find "$subdir" -type f \( -name "*.vgz" -o -name "*.vgm" \) | sort)
+            [[ ${#files[@]} -eq 0 ]] && continue
+            ((total_vgm_subdirs++))
+
+            for file in "${files[@]}"; do
+                file_name=$(basename "$file")
+                cat_id="${tld_id}-${sub_id}-${file_id}"
+                echo "${tld_id},${sub_id},0,${file_id},\"$(csv_escape "$cat_id")\",\"$(csv_escape "$tld_name")\",\"\",\"$(csv_escape "$subdir_name")\",\"$(csv_escape "$file_name")\"" >> "$TEMP_VGM"
+                ((file_id++)); ((total_vgm_tracks++))
+            done
+            ((sub_id++))
+        fi
+    done
+    ((tld_id++))
+done
+
+echo "------------------------------------------"
+echo "VGM TLDs   : $total_vgm_tlds"
+echo "VGM SubDirs: $total_vgm_subdirs"
+echo "VGM Tracks : $total_vgm_tracks"
+
+# =============================================================================
+# PASS 2 — Audio Catalogue (MP3 / WAV / FLAC)
+# =============================================================================
+echo "TLD_ID,SUB_ID,PLATFORM_ID,FILE_ID,Catalogue_ID,TLD_Name,Platform_Name,Album_Folder,File_Name,Meta_Artist,Meta_Album,Meta_Track_Title,Meta_Track_Number,Meta_Year,Meta_Genre,Meta_Source" > "$TEMP_AUDIO"
+
+tld_id=200; sub_id=2000
+total_audio_tracks=0; total_audio_subdirs=0; total_audio_tlds=0
+
+mapfile -t tlds < <(find "$WORK_DIR" -maxdepth 1 -mindepth 1 -type d | grep -vE "$excluded" | sort)
+
+for tld in "${tlds[@]}"; do
+    tld_name=$(basename "$tld")
+
+    # Skip if no audio files anywhere beneath this TLD
+    if ! find "$tld" -type f \( -name "*.mp3" -o -name "*.wav" -o -name "*.flac" \) | grep -q .; then
+        continue
+    fi
+
+    echo "Audio TLD: $tld_name ($tld_id)"
+    ((total_audio_tlds++))
+    platform_id=1
+
+    mapfile -t subdirs < <(find "$tld" -maxdepth 1 -mindepth 1 -type d | sort)
+
+    for subdir in "${subdirs[@]}"; do
+        subdir_name=$(basename "$subdir")
+
+        if is_platform_folder_audio "$subdir"; then
+            echo "  Platform/Artist: $subdir_name"
+            mapfile -t albums < <(find "$subdir" -maxdepth 1 -mindepth 1 -type d | sort)
+
+            for album in "${albums[@]}"; do
+                album_name=$(basename "$album")
+                file_id=1
+                mapfile -t files < <(find "$album" -type f \( -name "*.mp3" -o -name "*.wav" -o -name "*.flac" \) | sort)
+                [[ ${#files[@]} -eq 0 ]] && continue
+                ((total_audio_subdirs++))
+
+                for file in "${files[@]}"; do
+                    file_name=$(basename "$file")
+                    cat_id="${tld_id}-${sub_id}-${file_id}"
+
+                    r_artist=""; r_album=""; r_title=""; r_track=""; r_year=""; r_genre=""; r_source=""
+                    resolve_meta "$file" "$tld_name" "$subdir_name" "$album_name" "$file_id"
+
+                    echo "${tld_id},${sub_id},${platform_id},${file_id},\"$(csv_escape "$cat_id")\",\"$(csv_escape "$tld_name")\",\"$(csv_escape "$subdir_name")\",\"$(csv_escape "$album_name")\",\"$(csv_escape "$file_name")\",\"$(csv_escape "$r_artist")\",\"$(csv_escape "$r_album")\",\"$(csv_escape "$r_title")\",\"$(csv_escape "$r_track")\",\"$(csv_escape "$r_year")\",\"$(csv_escape "$r_genre")\",\"$(csv_escape "$r_source")\"" >> "$TEMP_AUDIO"
+
+                    ((file_id++)); ((total_audio_tracks++))
+                done
+                ((sub_id++))
+            done
+            ((platform_id++))
+        else
+            file_id=1
+            mapfile -t files < <(find "$subdir" -type f \( -name "*.mp3" -o -name "*.wav" -o -name "*.flac" \) | sort)
+            [[ ${#files[@]} -eq 0 ]] && continue
+            ((total_audio_subdirs++))
+
+            for file in "${files[@]}"; do
+                file_name=$(basename "$file")
+                cat_id="${tld_id}-${sub_id}-${file_id}"
+
+                r_artist=""; r_album=""; r_title=""; r_track=""; r_year=""; r_genre=""; r_source=""
+                resolve_meta "$file" "$tld_name" "" "$subdir_name" "$file_id"
+
+                echo "${tld_id},${sub_id},0,${file_id},\"$(csv_escape "$cat_id")\",\"$(csv_escape "$tld_name")\",\"\",\"$(csv_escape "$subdir_name")\",\"$(csv_escape "$file_name")\",\"$(csv_escape "$r_artist")\",\"$(csv_escape "$r_album")\",\"$(csv_escape "$r_title")\",\"$(csv_escape "$r_track")\",\"$(csv_escape "$r_year")\",\"$(csv_escape "$r_genre")\",\"$(csv_escape "$r_source")\"" >> "$TEMP_AUDIO"
+
+                ((file_id++)); ((total_audio_tracks++))
+            done
+            ((sub_id++))
+        fi
+    done
+    ((tld_id++))
+done
+
+echo "------------------------------------------"
+echo "Audio TLDs   : $total_audio_tlds"
+echo "Audio SubDirs: $total_audio_subdirs"
+echo "Audio Tracks : $total_audio_tracks"
+
+# =============================================================================
+# PASS 3 — Build dual-sheet XLSX via Python/openpyxl
+# =============================================================================
+echo "------------------------------------------"
+echo "Building XLSX workbook..."
+
+python3 - "$TEMP_VGM" "$TEMP_AUDIO" "$OUTPUT_XLSX" <<'PYEOF'
+import sys, csv
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+vgm_csv, audio_csv, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+wb = Workbook()
+
+# ---------------------------------------------------------------------------
+# Style helpers
+# ---------------------------------------------------------------------------
+HEADER_FILL_VGM   = PatternFill("solid", fgColor="1F4E79")   # dark navy
+HEADER_FILL_AUDIO = PatternFill("solid", fgColor="375623")   # dark green
+HEADER_FONT   = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+DATA_FONT     = Font(name="Arial", size=9)
+ALT_FILL      = PatternFill("solid", fgColor="EEF2F7")
+CENTER_ALIGN  = Alignment(horizontal="center", vertical="center")
+LEFT_ALIGN    = Alignment(horizontal="left",   vertical="center")
+THIN_SIDE     = Side(style="thin", color="CCCCCC")
+THIN_BORDER   = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
+
+def style_sheet(ws, header_fill, col_widths):
+    # Freeze top row
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 22
+
+    # Header row
+    for cell in ws[1]:
+        cell.font        = HEADER_FONT
+        cell.fill        = header_fill
+        cell.alignment   = CENTER_ALIGN
+        cell.border      = THIN_BORDER
+
+    # Data rows
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        fill = ALT_FILL if row_idx % 2 == 0 else None
+        for cell in row:
+            cell.font      = DATA_FONT
+            cell.border    = THIN_BORDER
+            cell.alignment = LEFT_ALIGN
+            if fill:
+                cell.fill = fill
+
+    # Column widths
+    for col_letter, width in col_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+    # Auto-filter on header row
+    ws.auto_filter.ref = ws.dimensions
+
+# ---------------------------------------------------------------------------
+# Sheet 1 — VGM Catalogue
+# ---------------------------------------------------------------------------
+ws_vgm = wb.active
+ws_vgm.title = "VGM Catalogue"
+
+with open(vgm_csv, newline="", encoding="utf-8") as f:
+    reader = csv.reader(f)
+    for row in reader:
+        ws_vgm.append(row)
+
+style_sheet(ws_vgm, HEADER_FILL_VGM, {
+    "A": 10, "B": 10, "C": 13, "D": 10,
+    "E": 20, "F": 22, "G": 22, "H": 35, "I": 40
+})
+
+# ---------------------------------------------------------------------------
+# Sheet 2 — Audio Catalogue
+# ---------------------------------------------------------------------------
+ws_audio = wb.create_sheet("Audio Catalogue")
+
+with open(audio_csv, newline="", encoding="utf-8") as f:
+    reader = csv.reader(f)
+    for row in reader:
+        ws_audio.append(row)
+
+style_sheet(ws_audio, HEADER_FILL_AUDIO, {
+    "A": 10, "B": 10, "C": 13, "D": 10,
+    "E": 20, "F": 22, "G": 22, "H": 35, "I": 40,
+    "J": 28, "K": 28, "L": 36, "M": 14, "N": 10, "O": 18, "P": 12
+})
+
+wb.save(out_path)
+print(f"Saved: {out_path}")
+PYEOF
+
+# Cleanup temp files
+rm -f "$TEMP_VGM" "$TEMP_AUDIO"
+
+echo "------------------------------------------"
+echo "VGM  Tracks : $total_vgm_tracks"
+echo "Audio Tracks: $total_audio_tracks"
+echo "Written     : $OUTPUT_XLSX"
+echo "Done."
