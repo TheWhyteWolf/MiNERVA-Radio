@@ -1,0 +1,24 @@
+#!/bin/bash
+# =============================================================================
+# minerva-xtract-rsn — Extract .rsn SNES music archives
+# Usage: minerva-xtract-rsn [directory]
+# =============================================================================
+
+DIR="${1:-.}"
+cd "$DIR" || { echo "Error: cannot cd to $DIR"; exit 1; }
+
+success=0
+failed=0
+
+for f in *.rsn; do
+    [ -f "$f" ] || continue
+    echo "Extracting: $f"
+    if unrar x -y "$f" "${f%.rsn}/"; then
+        ((success++))
+    else
+        echo "  ERROR: Failed to extract $f"
+        ((failed++))
+    fi
+done
+
+echo "Done. Success: $success | Failed: $failed"
