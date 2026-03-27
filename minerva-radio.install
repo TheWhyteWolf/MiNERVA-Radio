@@ -1,0 +1,22 @@
+post_install() {
+    echo ""
+    echo "  ╔══════════════════════════════════════════╗"
+    echo "  ║        MiNERVA RADIO — INSTALLED  ✔      ║"
+    echo "  ╚══════════════════════════════════════════╝"
+    echo ""
+    echo "  To complete setup, run the configuration wizard:"
+    echo ""
+    echo "      minerva-setup"
+    echo ""
+    echo "  This will configure your music directory, catalogue"
+    echo "  name, default indexer, and visualiser preferences."
+    echo ""
+    echo "  Optional AUR dependencies for full format support:"
+    echo "    vspcplay-git  — .spc playback"
+    echo "    cli-visualizer — spectrum visualiser"
+    echo ""
+}
+
+post_upgrade() {
+    post_install
+}
