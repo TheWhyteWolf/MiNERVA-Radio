@@ -24,18 +24,14 @@ music library.
 ```bash
 git clone https://github.com/TheWhyteWolf/MiNERVA-Radio.git
 cd MiNERVA-Radio
-sudo install -m755 minerva minerva-radio minerva-request minerva-setup \
-    minerva-index minerva-index-spc minerva-index-basic \
-    minerva-xtract minerva-xtract-rsn \
-    minerva-rename-rsn minerva-rename-spc \
-    /usr/bin/
+makepkg -si
 ```
 
 ---
 
 ## Dependencies
 
-All resolved automatically via AUR install.
+All resolved automatically via AUR install. -- TO BE ADDED --
 
 | Package | Purpose |
 |---|---|
