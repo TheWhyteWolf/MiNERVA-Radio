@@ -231,75 +231,72 @@ if [ "$1" == "--run-engine" ]; then
                 PULSE_SINK=vgm_radio vgmplayer "$file_path" || sleep 1
                 ;;
             *.mod|*.mp3|*.flac|*.wav)
-                PULSE_SINK=vgm_radio mpv --no-video --really-quiet \
-                    --af=loudnorm=I=-14 "$file_path" || sleep 1
-                ;;
-            *.spc)
-    SPC_DURATION=$(get_spc_duration "$file_path")
-    SPC_DURATION=${SPC_DURATION:-120}
-    FADE_DURATION=5
-    PLAY_DURATION=$(( SPC_DURATION - FADE_DURATION ))
-    # Safety: if track is shorter than fade, just play it straight
-    if [ "$PLAY_DURATION" -lt 1 ]; then
-        PLAY_DURATION=$SPC_DURATION
-        FADE_DURATION=0
-    fi
-    echo "$(date): SPC duration: ${SPC_DURATION}s, fade at ${PLAY_DURATION}s" >> "$DEBUG_LOG"
-
-    SPC_FIFO=$(mktemp -u /tmp/spc_XXXXXX.wav)
-    mkfifo "$SPC_FIFO"
-
-    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-        vspcplay --novideo --interpolate --echo --waveout "$SPC_FIFO" "$file_path" 2>/dev/null &
-    SPC_PID=$!
-
-    # Start mpv in background so we can fade its sink input
-    timeout "$((SPC_DURATION + 5))" \
-        mpv --no-video --really-quiet \
+            mpv --no-video --really-quiet \
             --audio-device=pulse/vgm_radio \
             --af=loudnorm=I=-14:linear=true \
-            --demuxer=rawaudio \
-            --demuxer-rawaudio-rate=32000 \
-            --demuxer-rawaudio-channels=2 \
-            --demuxer-rawaudio-format=s16le \
-            --length="$SPC_DURATION" \
-            "$SPC_FIFO"
-
-    # Wait for mpv to register as a sink input
-    MPV_SINK=""
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
-        sleep 0.3
-        MPV_SINK=$(pactl list sink-inputs | \
-            grep -B5 "application.process.id = \"$MPV_PID\"" | \
-            awk '/^Sink Input #/{print $NF}' | tr -d '#')
-        [ -n "$MPV_SINK" ] && break
-    done
-    echo "$(date): SPC mpv sink input: $MPV_SINK" >> "$DEBUG_LOG"
-
-    # Sleep until fade point
-    sleep "$PLAY_DURATION"
-
-    # Fade out mpv's sink input over FADE_DURATION seconds
-    if [ -n "$MPV_SINK" ] && [ "$FADE_DURATION" -gt 0 ]; then
-        steps=20
-        interval=$(echo "scale=3; $FADE_DURATION / $steps" | bc)
-        for i in $(seq $steps -1 0); do
-            vol=$(( i * 65536 / steps ))
-            pactl set-sink-input-volume "$MPV_SINK" "$vol" 2>/dev/null
-            sleep "$interval"
-        done
-    fi
-
-    kill $MPV_PID 2>/dev/null
-    wait $MPV_PID 2>/dev/null
-    kill $SPC_PID 2>/dev/null
-    wait $SPC_PID 2>/dev/null
-    rm -f "$SPC_FIFO"
-    SPC_FIFO=""
-    SPC_PID=""
-    MPV_PID=""
-    MPV_SINK=""
+            "$file_path" || sleep 1
     ;;
+             *.spc)
+  SPC_DURATION=$(get_spc_duration "$file_path")
+  SPC_DURATION=${SPC_DURATION:-120}
+  FADE_DURATION=5
+  PLAY_DURATION=$(( SPC_DURATION - FADE_DURATION ))
+  if [ "$PLAY_DURATION" -lt 1 ]; then
+    PLAY_DURATION=$SPC_DURATION
+    FADE_DURATION=0
+  fi
+  echo "$(date): SPC duration: ${SPC_DURATION}s, fade at ${PLAY_DURATION}s" >> "$DEBUG_LOG"
+
+  SPC_FIFO=$(mktemp -u /tmp/spc_XXXXXX.wav)
+  mkfifo "$SPC_FIFO"
+
+  SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+  vspcplay --novideo --echo --waveout "$SPC_FIFO" "$file_path" 2>/dev/null &
+  SPC_PID=$!
+
+  # mpv reads the WAV header from vspcplay directly — no demuxer flags needed
+  timeout "$((SPC_DURATION + 5))" \
+  mpv --no-video --really-quiet \
+    --audio-device=pulse/vgm_radio \
+    --af=loudnorm=I=-14:linear=true \
+    --length="$SPC_DURATION" \
+    "$SPC_FIFO" &
+  MPV_PID=$!
+
+  # Wait for mpv to register as a sink input
+  MPV_SINK=""
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.3
+    MPV_SINK=$(pactl list sink-inputs | \
+      grep -B5 "application.process.id = \"$MPV_PID\"" | \
+      awk '/^Sink Input #/{print $NF}' | tr -d '#')
+    [ -n "$MPV_SINK" ] && break
+  done
+  echo "$(date): SPC mpv sink input: $MPV_SINK" >> "$DEBUG_LOG"
+
+  sleep "$PLAY_DURATION"
+
+  # Fade out over FADE_DURATION seconds
+  if [ -n "$MPV_SINK" ] && [ "$FADE_DURATION" -gt 0 ]; then
+    steps=20
+    interval=$(echo "scale=3; $FADE_DURATION / $steps" | bc)
+    for i in $(seq $steps -1 0); do
+      vol=$(( i * 65536 / steps ))
+      pactl set-sink-input-volume "$MPV_SINK" "$vol" 2>/dev/null
+      sleep "$interval"
+    done
+  fi
+
+  kill $MPV_PID 2>/dev/null
+  wait $MPV_PID 2>/dev/null
+  kill $SPC_PID 2>/dev/null
+  wait $SPC_PID 2>/dev/null
+  rm -f "$SPC_FIFO"
+  SPC_FIFO=""
+  SPC_PID=""
+  MPV_PID=""
+  MPV_SINK=""
+  ;;
             *.sid)
                 SID_MD5=$(md5sum "$file_path" | awk '{print $1}')
                 SID_DURATION=120
@@ -340,7 +337,14 @@ tmux new-session -d -s vgm_radio -c "$VGM_DIR" "$0 --run-engine"
 
 sleep 3
 
-tmux split-window -v -t vgm_radio "$VIS_PATH"
+# Split the main window to put the visualizer at the bottom (becomes pane 0.1)
+tmux split-window -v -t vgm_radio:0.0 "$VIS_PATH"
+
+# Split the VISUALIZER pane to put the ticker at the VERY bottom (becomes pane 0.2)
+# The -l 1 flag forces this new pane to be exactly 1 character high
+tmux split-window -v -l 1 -t vgm_radio:0.1 "bash $SCRIPT_DIR/ticker.sh"
+
+# Resize the main player pane back to your preferred height
 tmux resize-pane -t vgm_radio:0.0 -y 12
 
 sleep 2
